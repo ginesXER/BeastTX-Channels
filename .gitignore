@@ -1,0 +1,33 @@
+## Build results
+bin/
+obj/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Rider
+.idea/
+
+## VS Code
+.vscode/
+
+## OS files
+.DS_Store
+Thumbs.db
+
+## Logs
+*.log
+
+## Environment variables
+.env
+
+## NuGet
+*.nupkg
+*.snupkg
+
+## Coverage
+coverage/
