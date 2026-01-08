@@ -2,8 +2,6 @@
 // dotnet add package MAVLink --version 1.0.8
 
 using System;
-using System.Collections.Generic;
-using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -17,6 +15,8 @@ internal static class Program
     private const string MAVLINK_HOST = "192.168.144.11";
     private const int MAVLINK_PORT = 2000;
 
+    private static bool modeInitialized = false;
+
     private const int PWM_LOW = 1100;
     private const int PWM_HIGH = 1900;
 
@@ -24,10 +24,14 @@ internal static class Program
     private const byte TH2 = 127;
     private const byte TH3 = 129;
 
-
-    private const int RC_RATE_MS = 50;   // 20 Hz
-    private const int CTRL_RATE_MS = 100; // 10 Hz
+    private const int RC_RATE_MS = 50;     // 20 Hz
+    private const int CTRL_RATE_MS = 100;  // 10 Hz
     private const int STABLE_COUNT = 5;
+
+    // watchdog / mavlink flags
+    private const int TCP_RETRY_MS = 1000;
+    private const int MAVLINK_ALIVE_MS = 3000;   // heartbeat freshness => "mavlink connected"
+    private const int SYS_COMP_CHECK_MS = 2000;  // check every 2 seconds
 
     // --- debounce state ---
     private static byte _stableButtons;
@@ -36,12 +40,9 @@ internal static class Program
     private static string? _stableMode;
     private static int _modeCount = 0;
 
-    private static bool _stableRtl;
-    private static int _rtlCount = 0;
-
     private static bool _lastRtlButton = false;
 
-    // Your axis calibration (same meaning as python)
+    // Your axis calibration
     private static readonly AxisCfg[] AXES =
     {
         new AxisCfg("roll",     BufIndex:4,  Min:163, Center:30,  Max:127, RcIndex1Based:1),
@@ -52,11 +53,9 @@ internal static class Program
 
     private static readonly AxisCfg[] EXTRA =
     {
-        // your “circular” knobs
         new AxisCfg("rc10", BufIndex:9,  Min:127, Center:252, Max:129, RcIndex1Based:5),
         new AxisCfg("rc11", BufIndex:10, Min:127, Center:245, Max:129, RcIndex1Based:6),
     };
-    // ----------------------------------------
 
     // ---------- Win32 HID ----------
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -81,38 +80,37 @@ internal static class Program
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_SHARE_READ = 1;
     private const uint FILE_SHARE_WRITE = 2;
+  
+
 
     // ---------- MAVLink ----------
     private static readonly MAVLink.MavlinkParse Parser = new MAVLink.MavlinkParse();
 
-    // You can hard-set these if you want, but we’ll learn them from HEARTBEAT
+    // target (used for sending)
     private static byte _targetSys = 1;
     private static byte _targetComp = 1;
+
+    // learned from heartbeat (drainer parses)
+    private static byte _hbSys = 0;
+    private static byte _hbComp = 0;
+    private static long _lastHbMs = 0; // use Volatile
 
     // our sender identity
     private const byte OUR_SYS = 255;
     private const byte OUR_COMP = 190;
 
-    private static volatile bool _rxDrainRun = true;
+    // TCP shared
+    private static readonly object _netLock = new();
+    private static TcpClient? _tcp;
+    private static NetworkStream? _stream;
+    private static volatile bool _tcpUp = false;
 
     private static void Main()
     {
-        using var tcp = new TcpClient();
-        tcp.Connect(MAVLINK_HOST, MAVLINK_PORT);
-        tcp.NoDelay = true;
+        // TCP watchdog (connect/reconnect only)
+        new Thread(TcpWatchdog) { IsBackground = true }.Start();
 
-        using NetworkStream stream = tcp.GetStream();
-        Console.WriteLine("[OK] TCP connected");
-
-        // Drain RX so server buffers never fill (same idea as your python)
-        var rxThread = new Thread(() => RxDrain(stream)) { IsBackground = true };
-        rxThread.Start();
-
-        // Wait heartbeat to learn sysid/compid (best effort)
-        WaitHeartbeat(stream, timeoutMs: 5000);
-        Console.WriteLine($"[OK] Target sys/comp = {_targetSys}/{_targetComp}");
-
-        // Open HID
+        // Open HID (unchanged)
         IntPtr h = CreateFileW(
             HID_PATH,
             GENERIC_READ,
@@ -127,16 +125,15 @@ internal static class Program
 
         var buf = new byte[64];
 
-        // state
-        byte? lastButtons = null;
         string? lastMode = null;
         bool rtlActive = false;
 
-        var lastRc = new ushort[8]; // 0 means "no override"
+        var lastRc = new ushort[8];
         var rcTmp = new ushort[8];
 
         long nextRc = Environment.TickCount64;
         long nextCtrl = Environment.TickCount64;
+        long nextSysCompCheck = Environment.TickCount64;
 
         while (true)
         {
@@ -144,6 +141,26 @@ internal static class Program
             if (n < 12) continue;
 
             long now = Environment.TickCount64;
+
+            // every 2 seconds: verify sys/comp matches what heartbeat says
+            if (now >= nextSysCompCheck)
+            {
+                bool mavUp = (now - Volatile.Read(ref _lastHbMs)) <= MAVLINK_ALIVE_MS;
+                if (mavUp && _hbSys != 0 && _hbComp != 0)
+                {
+                    if (_targetSys != _hbSys || _targetComp != _hbComp)
+                    {
+                        _targetSys = _hbSys;
+                        _targetComp = _hbComp;
+                        Console.WriteLine($"[OK] Target sys/comp corrected to {_targetSys}/{_targetComp}");
+                    }
+                }
+
+                nextSysCompCheck = now + SYS_COMP_CHECK_MS;
+            }
+
+            NetworkStream? stream;
+            lock (_netLock) stream = _stream;
 
             // ---------- RC OVERRIDE (20 Hz) ----------
             if (now >= nextRc)
@@ -164,7 +181,7 @@ internal static class Program
                     rcTmp[a.RcIndex1Based - 1] = pwm;
                 }
 
-                SendRcOverride(stream, rcTmp);
+                if (stream != null) SendRcOverride(stream, rcTmp);
                 Array.Copy(rcTmp, lastRc, 8);
 
                 nextRc = now + RC_RATE_MS;
@@ -175,70 +192,60 @@ internal static class Program
             {
                 byte buttons = buf[1];
                 byte modeRaw = buf[6];
-                // ---- debounce buttons ----
-                if (buttons == _stableButtons)
-                {
-                    _buttonsCount++;
-                }
-                else
-                {
-                    _stableButtons = buttons;
-                    _buttonsCount = 1;
-                }
+
+                if (buttons == _stableButtons) _buttonsCount++;
+                else { _stableButtons = buttons; _buttonsCount = 1; }
 
                 if (_buttonsCount >= STABLE_COUNT)
                 {
-                    // servos 10..13
-                    SendDoSetServo(stream, 10, (buttons & 1) != 0 ? PWM_HIGH : PWM_LOW);
-                    SendDoSetServo(stream, 11, (buttons & 2) != 0 ? PWM_HIGH : PWM_LOW);
-                    SendDoSetServo(stream, 12, (buttons & 4) != 0 ? PWM_HIGH : PWM_LOW);
-                    SendDoSetServo(stream, 13, (buttons & 8) != 0 ? PWM_HIGH : PWM_LOW);
+                    if (stream != null)
+                    {
+                        SendDoSetServo(stream, 10, (buttons & 1) != 0 ? PWM_HIGH : PWM_LOW);
+                        SendDoSetServo(stream, 11, (buttons & 2) != 0 ? PWM_HIGH : PWM_LOW);
+                        SendDoSetServo(stream, 12, (buttons & 4) != 0 ? PWM_HIGH : PWM_LOW);
+                        SendDoSetServo(stream, 13, (buttons & 8) != 0 ? PWM_HIGH : PWM_LOW);
+                    }
 
                     bool rtlButton = (buttons & 16) != 0;
 
-                    // ---- RTL EDGE DETECT ----
                     if (rtlButton && !_lastRtlButton)
                     {
-                        // rising edge: OFF -> ON
                         rtlActive = true;
-                        SetModeCopter(stream, "RTL");
+                        if (stream != null) SetModeCopter(stream, "RTL");
                     }
                     else if (!rtlButton && _lastRtlButton)
                     {
-                        // falling edge: ON -> OFF
                         rtlActive = false;
-                        if (lastMode != null)
-                        SetModeCopter(stream, lastMode);
+                        if (lastMode != null && stream != null) SetModeCopter(stream, lastMode);
                     }
 
                     _lastRtlButton = rtlButton;
                 }
 
-
-
-
-                string m = DecodeMode(modeRaw);
-
-                // ---- debounce mode ----
-                if (m == _stableMode)
+                string? m = DecodeMode(modeRaw);
+                // ---- boot init: latch current mode stick immediately ----
+                if (!modeInitialized && m != null)
                 {
-                    _modeCount++;
-                }
-                else
-                {
+                    lastMode = m;
                     _stableMode = m;
-                    _modeCount = 1;
+                    _modeCount = STABLE_COUNT;  // treat as stable on boot
+                    modeInitialized = true;
                 }
+
+                if (m == _stableMode) _modeCount++;
+                else { _stableMode = m; _modeCount = 1; }
 
                 if (_modeCount == STABLE_COUNT && !rtlActive && m != lastMode)
                 {
-                    SetModeCopter(stream, m);
+                    if (m != null && stream != null) SetModeCopter(stream, m);
                     lastMode = m;
                 }
 
+                bool mavlinkUp = (now - Volatile.Read(ref _lastHbMs)) <= MAVLINK_ALIVE_MS;
 
                 Console.WriteLine(
-                    $"btn={buttons,3} modeRaw={modeRaw,3} | RTL={(rtlActive ? "ON" : "OFF")} MODE={lastMode}");
+                    $"btn={buttons,3} modeRaw={modeRaw,3} | TCP={(_tcpUp ? "UP" : "DOWN")} MAV={(mavlinkUp ? "UP" : "WAIT")} sys/comp={_targetSys}/{_targetComp} | RTL={(rtlActive ? "ON" : "OFF")} MODE={lastMode}"
+                );
 
                 nextCtrl = now + CTRL_RATE_MS;
             }
@@ -247,17 +254,92 @@ internal static class Program
         }
     }
 
+    // ----------------- TCP watchdog (simple) -----------------
+    private static void TcpWatchdog()
+    {
+        while (true)
+        {
+            if (!_tcpUp)
+            {
+                try
+                {
+                    var tcp = new TcpClient();
+ 
+
+                    tcp.Connect(MAVLINK_HOST, MAVLINK_PORT);
+                    tcp.NoDelay = true;
+                    var stream = tcp.GetStream();
+
+                    tcp.Client.SendTimeout = 500;
+                    tcp.Client.ReceiveTimeout = 500;
+                    stream.WriteTimeout = 500;
+                    stream.ReadTimeout = 500;
+
+                    lock (_netLock)
+                    {
+                        try { _stream?.Close(); } catch { }
+                        try { _tcp?.Close(); } catch { }
+                        _tcp = tcp;
+                        _stream = stream;
+                    }
+
+                    _tcpUp = true;
+                    Console.WriteLine("[OK] TCP connected");
+
+                    // single reader: drain + heartbeat detect
+                    new Thread(() => RxDrainAndHeartbeat(stream)) { IsBackground = true }.Start();
+                }
+                catch
+                {
+                    _tcpUp = false;
+                    Thread.Sleep(TCP_RETRY_MS);
+                }
+            }
+
+            Thread.Sleep(200);
+        }
+    }
+
+    private static void TcpDown()
+    {
+        _tcpUp = false;
+        lock (_netLock)
+        {
+            try { _stream?.Close(); } catch { }
+            try { _tcp?.Close(); } catch { }
+            _stream = null;
+            _tcp = null;
+        }
+    }
+
+    private const int WRITE_TIMEOUT_MS = 500;
+
+    private static void SafeWrite(NetworkStream stream, byte[] pkt)
+    {
+        try
+        {
+            // Never let the main thread hang on a TCP write.
+            var t = stream.WriteAsync(pkt, 0, pkt.Length);
+            if (!t.Wait(WRITE_TIMEOUT_MS))
+            {
+                TcpDown();
+            }
+        }
+        catch
+        {
+            TcpDown();
+        }
+    }
+
     // ----------------- MODE -----------------
-    private static string DecodeMode(byte v)
+    private static string? DecodeMode(byte v)
     {
         if (v == TH1) return "AUTO";
         if (v == TH2) return "LOITER";
         if (v == TH3) return "ALT_HOLD";
-        else return null;
+        return null;
     }
 
-    // ArduCopter custom_mode values (common defaults):
-    // ALT_HOLD=2, AUTO=3, LOITER=5, RTL=6. :contentReference[oaicite:0]{index=0}
     private static uint CopterCustomMode(string name) => name switch
     {
         "ALT_HOLD" => 2u,
@@ -269,20 +351,11 @@ internal static class Program
 
     private static void SetModeCopter(NetworkStream stream, string modeName)
     {
-        // Use MAV_CMD_DO_SET_MODE (176): param1 = base_mode, param2 = custom_mode. :contentReference[oaicite:1]{index=1}
-        // base_mode: set custom mode enabled
         const uint MAV_MODE_FLAG_CUSTOM_MODE_ENABLED = 1u;
-
         uint custom = CopterCustomMode(modeName);
         if (custom == 0) return;
 
-        SendCommandLong(
-            stream,
-            command: 176, // MAV_CMD_DO_SET_MODE
-            p1: MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            p2: custom,
-            p3: 0, p4: 0, p5: 0, p6: 0, p7: 0
-        );
+        SendCommandLong(stream, 176, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, custom, 0, 0, 0, 0, 0);
     }
 
     // ----------------- AXIS MAP -----------------
@@ -347,13 +420,13 @@ internal static class Program
         };
 
         byte[] pkt = Parser.GenerateMAVLinkPacket10(MAVLink.MAVLINK_MSG_ID.RC_CHANNELS_OVERRIDE, msg, OUR_SYS, OUR_COMP);
-        stream.Write(pkt, 0, pkt.Length);
+        try { SafeWrite(stream, pkt); }
+        catch { TcpDown(); }
     }
 
     private static void SendDoSetServo(NetworkStream stream, int servo, int pwm)
     {
-        // MAV_CMD_DO_SET_SERVO = 183 :contentReference[oaicite:2]{index=2}
-        SendCommandLong(stream, 183, p1: servo, p2: pwm, p3: 0, p4: 0, p5: 0, p6: 0, p7: 0);
+        SendCommandLong(stream, 183, servo, pwm, 0, 0, 0, 0, 0);
     }
 
     private static void SendCommandLong(
@@ -377,96 +450,116 @@ internal static class Program
         };
 
         byte[] pkt = Parser.GenerateMAVLinkPacket10(MAVLink.MAVLINK_MSG_ID.COMMAND_LONG, msg, OUR_SYS, OUR_COMP);
-        stream.Write(pkt, 0, pkt.Length);
+        try { SafeWrite(stream, pkt); }
+        catch { TcpDown(); }
     }
 
-    // ----------------- RX drain + heartbeat learn -----------------
-    private static void RxDrain(NetworkStream stream)
+    // ----------------- RX drain + heartbeat detect (single reader) -----------------
+    
+    private static void RxDrainAndHeartbeat(NetworkStream stream)
     {
         var b = new byte[4096];
-        while (_rxDrainRun)
+
+        // stability filter
+        byte lastSys = 0, lastComp = 0;
+        int sameCount = 0;
+
+        // parser state
+        int st = 0;
+        bool v2 = false;
+        int len = 0, payloadLeft = 0, sigLeft = 0;
+        byte sys = 0, comp = 0;
+        uint msgid = 0;
+        byte v2Incompat = 0;
+
+        void SeenHeartbeat(byte s, byte c)
+        {
+            if (s == 0 || c == 0) return;
+
+            if (s == lastSys && c == lastComp) sameCount++;
+            else { lastSys = s; lastComp = c; sameCount = 1; }
+
+            if (sameCount >= 3)
+            {
+                _hbSys = s;
+                _hbComp = c;
+                Volatile.Write(ref _lastHbMs, Environment.TickCount64);
+            }
+        }
+
+        while (_tcpUp)
         {
             try
             {
-                if (!stream.DataAvailable) { Thread.Sleep(10); continue; }
-                _ = stream.Read(b, 0, b.Length); // just drain
-            }
-            catch { Thread.Sleep(50); }
-        }
-    }
+                int n = stream.Read(b, 0, b.Length);
+                if (n <= 0) { TcpDown(); return; }
 
-    private static void WaitHeartbeat(NetworkStream stream, int timeoutMs)
-    {
-        // Minimal MAVLink v1/v2 frame scan just to learn sysid/compid from HEARTBEAT
-        // If it fails, we keep default 1/1.
-        long end = Environment.TickCount64 + timeoutMs;
-        var one = new byte[1];
+                for (int i = 0; i < n; i++)
+                {
+                    byte c = b[i];
 
-        // very small state machine for MAVLink1 only (0xFE)
-        int state = 0;
-        int len = 0, idx = 0;
-        byte sys = 1, comp = 1, msgid = 0;
-        var payload = new byte[255];
-
-        while (Environment.TickCount64 < end)
-        {
-            if (!stream.DataAvailable) { Thread.Sleep(5); continue; }
-            int r = stream.Read(one, 0, 1);
-            if (r != 1) continue;
-            byte c = one[0];
-
-            switch (state)
-            {
-                case 0: // stx
-                    if (c == 0xFE) { state = 1; }
-                    break;
-                case 1: // len
-                    len = c;
-                    idx = 0;
-                    state = 2; // seq next
-                    break;
-                case 2: // seq
-                    state = 3;
-                    break;
-                case 3: // sysid
-                    sys = c;
-                    state = 4;
-                    break;
-                case 4: // compid
-                    comp = c;
-                    state = 5;
-                    break;
-                case 5: // msgid
-                    msgid = c;
-                    if (len == 0) state = 7; else state = 6;
-                    break;
-                case 6: // payload
-                    payload[idx++] = c;
-                    if (idx >= len) state = 7;
-                    break;
-                case 7: // cka
-                    state = 8;
-                    break;
-                case 8: // ckb
-                    // if heartbeat msgid=0, accept (we’re not validating CRC here)
-                    if (msgid == 0)
+                    switch (st)
                     {
-                        _targetSys = sys;
-                        _targetComp = comp;
-                        return;
+                        case 0:
+                            if (c == 0xFE) { v2 = false; st = 1; }
+                            else if (c == 0xFD) { v2 = true; st = 1; }
+                            break;
+
+                        case 1:
+                            len = c;
+                            msgid = 0;
+                            sys = comp = 0;
+                            v2Incompat = 0;
+                            st = v2 ? 2 : 5;
+                            break;
+
+                        case 2: v2Incompat = c; st = 3; break; // incompat
+                        case 3: st = 4; break;                 // compat
+                        case 4: st = 5; break;                 // seq
+
+                        case 5: sys = c; st = 6; break;
+                        case 6: comp = c; st = v2 ? 7 : 10; break;
+
+                        case 7: msgid = c; st = 8; break;
+                        case 8: msgid |= (uint)c << 8; st = 9; break;
+                        case 9:
+                            msgid |= (uint)c << 16;
+                            payloadLeft = len;
+                            st = (payloadLeft == 0) ? 11 : 10;
+                            break;
+
+                        case 10:
+                            payloadLeft--;
+                            if (payloadLeft <= 0) st = 11;
+                            break;
+
+                        case 11: st = 12; break; // CRC1
+                        case 12:
+                            // CRC2 -> frame complete (no CRC validation)
+                            if (msgid == 0) SeenHeartbeat(sys, comp);
+                            sigLeft = (v2 && (v2Incompat & 0x01) != 0) ? 13 : 0;
+                            st = (sigLeft > 0) ? 13 : 0;
+                            break;
+
+                        case 13:
+                            sigLeft--;
+                            if (sigLeft <= 0) st = 0;
+                            break;
                     }
-                    state = 0;
-                    break;
+                }
+            }
+            catch (IOException ex) when (ex.InnerException is SocketException se && se.SocketErrorCode == SocketError.TimedOut)
+            {
+                continue; // no data right now
+            }
+            catch
+            {
+                TcpDown();
+                return;
             }
         }
     }
 
-    // ----------------- utils -----------------
-    private static bool Same(ushort[] a, ushort[] b)
-    {
-        for (int i = 0; i < 8; i++) if (a[i] != b[i]) return false;
-        return true;
-    }
 
     private readonly record struct AxisCfg(string Name, int BufIndex, int Min, int Center, int Max, int RcIndex1Based);
 }
